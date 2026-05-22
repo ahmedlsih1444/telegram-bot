@@ -5,12 +5,16 @@ Group Media Moderation Bot
 - Auto-deletes messages with banned phrases (except from super user)
 - Reports every deletion to the group owner via DM
 - Alerts super user when someone tries to delete his media
+- Runs an HTTP health server so Render free tier can host it 24/7
 """
 
 import asyncio
 import json
 import logging
+import os
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
 from telegram import Chat, ChatMember, ChatMemberAdministrator, ChatMemberOwner, Update
@@ -26,11 +30,12 @@ from telegram.ext import (
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 TOKEN        = "8779308980:AAFdyE1RkgPpwGamwWsLaSNeIYelVWREzC0"
-SUPER        = "hmdslih"                          # username without @
-TRIGGERS     = {"احذف", "delete"}                 # delete command words
-BANNED       = {"كسخت ايثار", "كسخت المدير"}     # auto-delete phrases
-CACHE_TTL    = 60                                  # seconds to keep cached data
-CHATS_FILE   = "known_chats.json"                 # persist group IDs across restarts
+SUPER        = "hmdslih"
+TRIGGERS     = {"احذف", "delete"}
+BANNED       = {"كسخت ايثار", "كسخت المدير"}
+CACHE_TTL    = 60
+CHATS_FILE   = "known_chats.json"
+PORT         = int(os.environ.get("PORT", 8080))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -45,20 +50,27 @@ log = logging.getLogger("bot")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
-# {chat_id: (frozenset[admin_ids], owner_id|None, timestamp)}
 _admin_cache: dict[int, tuple[frozenset, Optional[int], float]] = {}
+_perm_cache:  dict[int, tuple[bool, float]] = {}
+_known:       set[int] = set()
+_super_id:    Optional[int] = None
+_bot_name:    str = ""
 
-# {chat_id: (can_delete_bool, timestamp)}
-_perm_cache: dict[int, tuple[bool, float]] = {}
+# ── Health server (keeps Render web service alive) ────────────────────────────
 
-# Known group IDs — loaded from disk and saved whenever a new group is seen
-_known: set[int] = set()
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *_):
+        pass
 
-# Super user's numeric Telegram ID — learned from their first message
-_super_id: Optional[int] = None
-
-# Bot's own username — fetched at startup, required for @mention detection
-_bot_name: str = ""
+def _start_health_server():
+    try:
+        HTTPServer(("0.0.0.0", PORT), _Health).serve_forever()
+    except OSError:
+        log.warning("health server port %d in use — skipping (ok on Replit)", PORT)
 
 # ── Disk helpers ──────────────────────────────────────────────────────────────
 
@@ -80,11 +92,9 @@ def _is_super(username: Optional[str]) -> bool:
     return bool(username) and username.lstrip("@").lower() == SUPER.lower()
 
 def _is_media(msg) -> bool:
-    """Visual media only — photo, video, GIF, sticker, round video."""
     return bool(msg.photo or msg.video or msg.animation or msg.sticker or msg.video_note)
 
 def _is_delete_cmd(msg) -> bool:
-    """True only when the bot is @mentioned AND a trigger word is present."""
     text = msg.text or msg.caption or ""
     if not text or not _bot_name:
         return False
@@ -105,7 +115,6 @@ def _has_banned(text: Optional[str]) -> bool:
 # ── Async API helpers ─────────────────────────────────────────────────────────
 
 async def _get_admins(bot, chat_id: int) -> tuple[frozenset, Optional[int]]:
-    """Fetch admin list + owner in one call. Cached for CACHE_TTL seconds."""
     cached = _admin_cache.get(chat_id)
     if cached and time.monotonic() - cached[2] < CACHE_TTL:
         return cached[0], cached[1]
@@ -119,21 +128,19 @@ async def _get_admins(bot, chat_id: int) -> tuple[frozenset, Optional[int]]:
     return ids, owner
 
 async def _bot_can_delete(bot, chat_id: int) -> bool:
-    """Check whether the bot has delete-messages permission. Cached."""
     cached = _perm_cache.get(chat_id)
     if cached and time.monotonic() - cached[1] < CACHE_TTL:
         return cached[0]
     try:
-        me  = await bot.get_chat_member(chat_id, bot.id)
-        ok  = isinstance(me, ChatMemberOwner) or (
-              isinstance(me, ChatMemberAdministrator) and bool(me.can_delete_messages))
+        me = await bot.get_chat_member(chat_id, bot.id)
+        ok = isinstance(me, ChatMemberOwner) or (
+             isinstance(me, ChatMemberAdministrator) and bool(me.can_delete_messages))
     except TelegramError:
         ok = False
     _perm_cache[chat_id] = (ok, time.monotonic())
     return ok
 
 async def _prewarm(bot, chat_id: int) -> None:
-    """Warm both caches in parallel — called at startup and on first message."""
     await asyncio.gather(
         _get_admins(bot, chat_id),
         _bot_can_delete(bot, chat_id),
@@ -165,7 +172,6 @@ async def _forward(bot, to_id: int, from_chat: int, msg_id: int) -> None:
 # ── Core actions ──────────────────────────────────────────────────────────────
 
 async def _report_to_owner(bot, owner_id: int, chat, media_msg, cmd_msg, actor: str) -> None:
-    """Send header + both forwarded messages to the owner — all in one round trip."""
     group = chat.title or str(chat.id)
     await asyncio.gather(
         _dm(bot, owner_id,
@@ -177,7 +183,6 @@ async def _report_to_owner(bot, owner_id: int, chat, media_msg, cmd_msg, actor: 
     )
 
 async def _alert_super_user(bot, chat, cmd_msg, actor: str) -> None:
-    """Tell the super user someone tried to delete his media."""
     if not _super_id:
         return
     group = chat.title or str(chat.id)
@@ -199,7 +204,6 @@ async def _no_permission_msg(bot, chat_id: int) -> None:
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def on_start(app: Application) -> None:
-    """Fetch bot username and pre-warm caches for all known groups."""
     global _bot_name
     me = await app.bot.get_me()
     _bot_name = (me.username or "").lower()
@@ -207,11 +211,9 @@ async def on_start(app: Application) -> None:
     if _known:
         log.info("pre-warming %d group(s)…", len(_known))
         await asyncio.gather(*(_prewarm(app.bot, c) for c in _known), return_exceptions=True)
-        log.info("ready.")
-
+    log.info("ready.")
 
 async def on_my_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Invalidate caches when the bot's admin status changes in a group."""
     r = update.my_chat_member
     if not r or r.chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
         return
@@ -233,7 +235,6 @@ async def on_my_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except TelegramError:
         pass
 
-
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global _super_id
 
@@ -246,20 +247,17 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uname    = (user.username or "").lower()
     is_super = _is_super(uname)
 
-    # Learn super user's numeric ID on first sighting
     if is_super and not _super_id:
         _super_id = user.id
 
-    # Register new groups and pre-warm immediately
     if chat.id not in _known:
         _known.add(chat.id)
         _save()
         asyncio.create_task(_prewarm(ctx.bot, chat.id))
 
-    text = msg.text or msg.caption or ""
+    text  = msg.text or msg.caption or ""
     actor = f"@{user.username}" if user.username else f"ID {user.id}"
 
-    # ── 1. Auto-delete banned phrases ─────────────────────────────────────────
     if not is_super and _has_banned(text):
         can_del = await _bot_can_delete(ctx.bot, chat.id)
         if not can_del:
@@ -269,7 +267,6 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("banned phrase deleted | %s | chat %s", actor, chat.id)
         return
 
-    # ── 2. Delete command (@bot احذف / @bot delete) ───────────────────────────
     if not _is_delete_cmd(msg):
         return
 
@@ -277,18 +274,15 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not target or not _is_media(target):
         return
 
-    # Block deletion of the super user's own media — alert him instead
     if _is_super(target.from_user.username if target.from_user else None) and not is_super:
         await _alert_super_user(ctx.bot, chat, msg, actor)
         return
 
-    # Fetch admin list + bot permission in one parallel round trip
     (admin_ids, owner_id), can_del = await asyncio.gather(
         _get_admins(ctx.bot, chat.id),
         _bot_can_delete(ctx.bot, chat.id),
     )
 
-    # Must be admin (or super user) to delete
     if not is_super and user.id not in admin_ids:
         return
 
@@ -296,17 +290,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _no_permission_msg(ctx.bot, chat.id)
         return
 
-    # Report to owner BEFORE deleting (can't forward a deleted message)
     if owner_id:
         await _report_to_owner(ctx.bot, owner_id, chat, target, msg, actor)
 
-    # Delete media + command message simultaneously
     await asyncio.gather(
         _delete(ctx.bot, chat.id, target.message_id),
         _delete(ctx.bot, chat.id, msg.message_id),
     )
     log.info("deleted media=%s cmd=%s by %s", target.message_id, msg.message_id, actor)
-
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("unhandled error: %s", ctx.error)
@@ -316,6 +307,9 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     global _known
     _known = _load()
+
+    threading.Thread(target=_start_health_server, daemon=True).start()
+    log.info("health server on port %d", PORT)
 
     app = (
         Application.builder()
