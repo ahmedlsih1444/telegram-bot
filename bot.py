@@ -95,19 +95,8 @@ def _is_media(msg) -> bool:
     return bool(msg.photo or msg.video or msg.animation or msg.sticker or msg.video_note)
 
 def _is_delete_cmd(msg) -> bool:
-    text = msg.text or msg.caption or ""
-    if not text or not _bot_name:
-        return False
-    entities = msg.entities or msg.caption_entities or []
-    mentioned = any(
-        e.type == "mention"
-        and text[e.offset : e.offset + e.length].lstrip("@").lower() == _bot_name
-        for e in entities
-    )
-    if not mentioned:
-        return False
-    words = [w for w in text.split() if not w.startswith("@")]
-    return " ".join(words).strip().lower() in TRIGGERS
+    text = (msg.text or msg.caption or "").strip()
+    return text.lower() in TRIGGERS
 
 def _has_banned(text: Optional[str]) -> bool:
     return bool(text) and any(phrase in text for phrase in BANNED)
